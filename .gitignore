@@ -1,0 +1,6 @@
+# The freshly built Image is dropped into the AnyKernel3 template by the CI
+# right before zipping; it must never be committed.
+anykernel/Image
+
+# Installer produced by the CI.
+/*_kernelsu_*.zip

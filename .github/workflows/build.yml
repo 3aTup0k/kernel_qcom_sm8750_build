@@ -2,10 +2,20 @@ name: Build kernel
 
 # Builds the Xiaomi 15 (dada, SM8750) GKI kernel from the fork
 # 3aTup0k/android_kernel_qcom_sm8750 using the author's plain `make` + clang
-# method (no repo, no kleaf). The resulting release string is made to match a
-# kleaf build, e.g.:
-#   6.6.144-android15-8-4k-MaybeKernel-g1234567890ab
-# (see the "Emulate kleaf release string" step below).
+# method (no repo, no kleaf), packs the resulting Image into the AnyKernel3
+# installer (anykernel/ in this repo) and — on a manual run — publishes it as a
+# GitHub release.
+#
+# Installer file name:
+#   <ROOT_MANAGER>-<codename>-<PLATFORM>-<KERNEL_NAME>_<release>-kernelsu_<ver>.zip
+# Release tag:
+#   <release>-<short kernel commit hash>           (default)
+#   <release>-<short kernel commit hash>-ksu<ver>  (when update_ksu = yes)
+#
+# The KernelSU driver vendored in the kernel tree is upstream tiann/KernelSU with
+# SUSFS grafted in (see apex-patches/kernelsu/README.md). By default the build
+# uses exactly what is committed. Setting update_ksu = yes re-vendors the latest
+# upstream KernelSU first - see scripts/sync-kernelsu.sh.
 
 on:
   workflow_dispatch:
@@ -14,22 +24,43 @@ on:
         description: Kernel branch or tag to build
         required: false
         default: lineage-23.2
+      kernel_release:
+        description: Kernel release version (used in the installer name and release tag)
+        required: false
+        default: R1.2
+      update_ksu:
+        description: Sync the latest upstream KernelSU before building
+        type: choice
+        options:
+          - "no"
+          - "yes"
+        default: "no"
   push:
     branches: [main]
   schedule:
     # Every Saturday 03:00 UTC
     - cron: "0 3 * * 6"
 
-# Cancel an in-flight build if the same ref is pushed again.
+# Cancel an in-flight build if the same kernel ref is started again.
 concurrency:
-  group: build-${{ github.ref }}-${{ github.event.inputs.kernel_ref || 'lineage-23.2' }}
+  group: build-${{ github.event.inputs.kernel_ref || 'lineage-23.2' }}
   cancel-in-progress: true
 
 env:
   KERNEL_REPO: 3aTup0k/android_kernel_qcom_sm8750
   KERNEL_REF: ${{ github.event.inputs.kernel_ref || 'lineage-23.2' }}
+  KERNEL_RELEASE: ${{ github.event.inputs.kernel_release || 'R1.2' }}
+  UPDATE_KSU: ${{ github.event.inputs.update_ksu || 'no' }}
+
+  # Installer name components
+  ROOT_MANAGER: KernelSU
+  DEVICE_CODENAME: dada
+  PLATFORM: SM8750
+  KERNEL_NAME: MaybeKernel
+
   # Prefix that kleaf would normally compute from BRANCH + KMI generation.
   KLEAF_LOCALVERSION: "-android15-8"
+
   CLANG_VER: clang-r510928
   CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android15-release/clang-r510928.tar.gz
 
@@ -37,6 +68,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    permissions:
+      contents: write   # required to publish the release
 
     steps:
       - name: Free up disk space
@@ -59,6 +92,9 @@ jobs:
           echo "--- memory ---"; free -h
           echo "--- disk ---"; df -h /
 
+      - name: Checkout build scripts (AnyKernel3 template)
+        uses: actions/checkout@v4
+
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
@@ -74,7 +110,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex \
             libssl-dev libelf-dev libncurses-dev \
-            rsync lz4 zstd cpio unzip dos2unix \
+            rsync lz4 zstd cpio unzip zip dos2unix patch \
             dwarves python3 perl \
             binutils-aarch64-linux-gnu
 
@@ -95,12 +131,28 @@ jobs:
           rm -f clang.tar.gz
           "$CLANG_VER/bin/clang" --version
 
+      - name: Sync latest KernelSU (optional)
+        if: env.UPDATE_KSU == 'yes'
+        run: |
+          # Re-vendors upstream tiann/KernelSU and re-grafts the in-tree SUSFS
+          # support. The SUSFS patch is pinned to a KernelSU revision, so this
+          # fails loudly instead of producing a kernel with a broken root.
+          set +e
+          bash scripts/sync-kernelsu.sh kernel
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "::notice::KernelSU synced from upstream (KSU_VERSION $(sed -n 's/^KSU_VERSION *?= *\([0-9][0-9]*\).*/\1/p' kernel/drivers/kernelsu/Kbuild | head -1))" ;;
+            3) echo "::notice::KernelSU is already up to date" ;;
+            *) echo "::error::KernelSU sync failed (rc=$rc)"; exit "$rc" ;;
+          esac
+
       - name: Emulate kleaf release string
         working-directory: kernel
         run: |
-          # kleaf would inject "-android15-8-g<hash>" into the build dir via a
-          # localversion file. We reproduce that so a plain `make` build reports
-          # the same version as a kleaf build.
+          # kleaf injects "-android15-8-g<hash>" via a localversion file in the
+          # build dir. We reproduce it so a plain `make` build reports the same
+          # version as a kleaf build.
           HASH=$(git rev-parse --short=12 HEAD)
           printf '%s-g%s\n' "$KLEAF_LOCALVERSION" "$HASH" > localversion
           echo "localversion = $(cat localversion)"
@@ -119,27 +171,72 @@ jobs:
 
           echo "--- disk after build ---"; df -h /
 
-      - name: Show kernel version
-        working-directory: kernel
+      - name: Pack AnyKernel3 installer
+        id: pack
         run: |
-          strings out/arch/arm64/boot/Image | grep -m1 'Linux version'
+          # Kernel version string as embedded in the Image.
+          VERSION_STRING=$(strings kernel/out/arch/arm64/boot/Image | grep -m1 -oE 'Linux version [^ ]+' | sed 's/Linux version //')
+          [ -n "$VERSION_STRING" ] || { echo "could not read kernel version"; exit 1; }
 
-      - name: Collect artifacts
-        working-directory: kernel
-        run: |
-          mkdir -p ../artifacts
-          cp out/arch/arm64/boot/Image ../artifacts/Image
+          # KernelSU version code: the pinned vendored revision in the tree.
+          KSU_VERSION=$(sed -n 's/^KSU_VERSION *?= *\([0-9][0-9]*\).*/\1/p' kernel/drivers/kernelsu/Kbuild | head -1)
+          [ -n "$KSU_VERSION" ] || KSU_VERSION=32680
+
+          SHORT_HASH=$(git -C kernel rev-parse --short=12 HEAD)
+
+          # A build-time KernelSU sync is not committed, so the kernel commit
+          # hash alone no longer identifies the result - fold the KernelSU
+          # version into the tag in that case.
+          if [ "$UPDATE_KSU" = "yes" ]; then
+            TAG_NAME="${KERNEL_RELEASE}-${SHORT_HASH}-ksu${KSU_VERSION}"
+          else
+            TAG_NAME="${KERNEL_RELEASE}-${SHORT_HASH}"
+          fi
+
+          ZIP_NAME="${ROOT_MANAGER}-${DEVICE_CODENAME}-${PLATFORM}-${KERNEL_NAME}_${KERNEL_RELEASE}-kernelsu_${KSU_VERSION}.zip"
+
+          echo "version string : $VERSION_STRING"
+          echo "KernelSU ver   : $KSU_VERSION"
+          echo "kernel commit  : $SHORT_HASH"
+          echo "release tag    : $TAG_NAME"
+          echo "installer zip  : $ZIP_NAME"
+
+          cp kernel/out/arch/arm64/boot/Image anykernel/Image
+          ( cd anykernel && zip -r9 "../$ZIP_NAME" . )
+
+          unzip -l "$ZIP_NAME" | tail -5
+
           {
-            strings out/arch/arm64/boot/Image | grep -m1 -o 'Linux version [^ ]*' | awk '{print $3}'
-            echo "$GITHUB_SHA"
-          } > ../artifacts/README.txt
-          cp out/.config ../artifacts/kernel.config || true
-          cat ../artifacts/README.txt
+            echo "version_string=$VERSION_STRING"
+            echo "ksu_version=$KSU_VERSION"
+            echo "short_hash=$SHORT_HASH"
+            echo "tag_name=$TAG_NAME"
+            echo "zip_name=$ZIP_NAME"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Upload Image
+      - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Image-${{ env.KERNEL_REF }}-${{ github.run_number }}
-          path: artifacts/
+          name: ${{ steps.pack.outputs.zip_name }}
+          path: ${{ steps.pack.outputs.zip_name }}
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pack.outputs.tag_name }}
+          name: ${{ env.KERNEL_NAME }} ${{ env.KERNEL_RELEASE }} — ${{ steps.pack.outputs.version_string }}
+          files: ${{ steps.pack.outputs.zip_name }}
+          fail_on_unmatched_files: true
+          body: |
+            **${{ env.KERNEL_NAME }} ${{ env.KERNEL_RELEASE }}** for Xiaomi 15 (dada, SM8750)
+
+            - Kernel: `${{ steps.pack.outputs.version_string }}`
+            - KernelSU version: `${{ steps.pack.outputs.ksu_version }}`
+            - Kernel commit: `${{ steps.pack.outputs.short_hash }}` (${{ env.KERNEL_REPO }} @ ${{ env.KERNEL_REF }})
+            - Installer: `${{ steps.pack.outputs.zip_name }}` (AnyKernel3)
+
+            Flash the zip in a custom recovery / kernel manager. The Image patches
+            the boot ramdisk (GKI); vendor modules are left untouched.
