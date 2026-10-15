@@ -1,0 +1,145 @@
+name: Build kernel
+
+# Builds the Xiaomi 15 (dada, SM8750) GKI kernel from the fork
+# 3aTup0k/android_kernel_qcom_sm8750 using the author's plain `make` + clang
+# method (no repo, no kleaf). The resulting release string is made to match a
+# kleaf build, e.g.:
+#   6.6.144-android15-8-4k-MaybeKernel-g1234567890ab
+# (see the "Emulate kleaf release string" step below).
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: Kernel branch or tag to build
+        required: false
+        default: lineage-23.2
+  push:
+    branches: [main]
+  schedule:
+    # Every Saturday 03:00 UTC
+    - cron: "0 3 * * 6"
+
+# Cancel an in-flight build if the same ref is pushed again.
+concurrency:
+  group: build-${{ github.ref }}-${{ github.event.inputs.kernel_ref || 'lineage-23.2' }}
+  cancel-in-progress: true
+
+env:
+  KERNEL_REPO: 3aTup0k/android_kernel_qcom_sm8750
+  KERNEL_REF: ${{ github.event.inputs.kernel_ref || 'lineage-23.2' }}
+  # Prefix that kleaf would normally compute from BRANCH + KMI generation.
+  KLEAF_LOCALVERSION: "-android15-8"
+  CLANG_VER: clang-r510928
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android15-release/clang-r510928.tar.gz
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
+      - name: Add swap space
+        run: |
+          sudo fallocate -l 8G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=8192
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          echo "--- memory ---"; free -h
+          echo "--- disk ---"; df -h /
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ env.KERNEL_REF }}
+          path: kernel
+          fetch-depth: 1
+          submodules: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev libncurses-dev \
+            rsync lz4 zstd cpio unzip dos2unix \
+            dwarves python3 perl \
+            binutils-aarch64-linux-gnu
+
+      - name: Cache AOSP clang
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CLANG_VER }}
+          key: ${{ runner.os }}-${{ env.CLANG_VER }}
+
+      - name: Fetch AOSP clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          echo "Downloading $CLANG_VER ..."
+          curl -sSL --retry 5 --retry-delay 5 -o clang.tar.gz "$CLANG_URL"
+          mkdir -p "$CLANG_VER"
+          tar -C "$CLANG_VER" -zxf clang.tar.gz
+          rm -f clang.tar.gz
+          "$CLANG_VER/bin/clang" --version
+
+      - name: Emulate kleaf release string
+        working-directory: kernel
+        run: |
+          # kleaf would inject "-android15-8-g<hash>" into the build dir via a
+          # localversion file. We reproduce that so a plain `make` build reports
+          # the same version as a kleaf build.
+          HASH=$(git rev-parse --short=12 HEAD)
+          printf '%s-g%s\n' "$KLEAF_LOCALVERSION" "$HASH" > localversion
+          echo "localversion = $(cat localversion)"
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/$CLANG_VER/bin:$PATH"
+          export ARCH=arm64
+          export LLVM=1 LLVM_IAS=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          mkdir -p out
+          make O=out gki_defconfig
+          make -j"$(nproc)" O=out Image
+
+          echo "--- disk after build ---"; df -h /
+
+      - name: Show kernel version
+        working-directory: kernel
+        run: |
+          strings out/arch/arm64/boot/Image | grep -m1 'Linux version'
+
+      - name: Collect artifacts
+        working-directory: kernel
+        run: |
+          mkdir -p ../artifacts
+          cp out/arch/arm64/boot/Image ../artifacts/Image
+          {
+            strings out/arch/arm64/boot/Image | grep -m1 -o 'Linux version [^ ]*' | awk '{print $3}'
+            echo "$GITHUB_SHA"
+          } > ../artifacts/README.txt
+          cp out/.config ../artifacts/kernel.config || true
+          cat ../artifacts/README.txt
+
+      - name: Upload Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-${{ env.KERNEL_REF }}-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
